@@ -622,6 +622,18 @@ function RestCard({ onFinish }: { onFinish: () => void }) {
 }
 
 function DownloadApp() {
+  const [environmentChecked, setEnvironmentChecked] = useState(false)
+  const [isDesktopApp, setIsDesktopApp] = useState(false)
+
+  useEffect(() => {
+    // Tauri injects this internal bridge in its native WebView. Do not offer the
+    // installer from inside the app the user has already installed.
+    setIsDesktopApp('__TAURI_INTERNALS__' in window)
+    setEnvironmentChecked(true)
+  }, [])
+
+  if (!environmentChecked || isDesktopApp) return null
+
   return (
     <section className='mt-6 border-t border-white/5 pt-6'>
       <div className='mb-4'>
