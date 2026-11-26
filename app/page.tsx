@@ -4,15 +4,16 @@ import {
   Apple,
   ChevronRight,
   Download,
-  Dumbbell,
   LogOut,
   Plus,
+  RefreshCw,
   Settings,
   Sparkles,
   Timer,
   X
 } from 'lucide-react'
 import { FormEvent, useCallback, useEffect, useState } from 'react'
+import { toast } from 'sonner'
 import { supabase } from './lib/supabase'
 
 type Key = 'pushups' | 'dips' | 'pullups' | 'squats' | 'abs'
@@ -83,7 +84,7 @@ export default function Home() {
   const [progress, setProgress] = useState<Progress[]>(defaults)
   const [logs, setLogs] = useState<Log[]>([])
   const [settings, setSettings] = useState(false)
-  const [notice, setNotice] = useState('')
+  const [syncing, setSyncing] = useState(false)
 
   const sessionExpired = useCallback(async () => {
     const maxDays = Number(process.env.NEXT_PUBLIC_SESSION_MAX_DAYS || 7)
@@ -93,7 +94,7 @@ export default function Home() {
       localStorage.removeItem('base_last_login_at')
       setUserEmail(null)
       setUserId(null)
-      setNotice('Сеанс завершено. Увійдіть знову.')
+      toast.info('Сеанс завершено. Увійдіть знову.')
       return true
     }
     return false
@@ -126,6 +127,16 @@ export default function Home() {
     setLogs((dbLogs || []) as Log[])
   }, [])
 
+  const refreshData = useCallback(async () => {
+    if (!userId || syncing) return
+    setSyncing(true)
+    try {
+      await loadData(userId)
+    } finally {
+      setSyncing(false)
+    }
+  }, [loadData, syncing, userId])
+
   useEffect(() => {
     const boot = async () => {
       if (await sessionExpired()) {
@@ -142,8 +153,14 @@ export default function Home() {
       setLoading(false)
     }
     boot()
-    const visibility = () => {
-      if (document.visibilityState === 'visible') sessionExpired()
+    const visibility = async () => {
+      if (document.visibilityState === 'visible') {
+        const expired = await sessionExpired()
+        if (!expired) {
+          const { data } = await supabase.auth.getSession()
+          if (data.session?.user) await loadData(data.session.user.id)
+        }
+      }
     }
     document.addEventListener('visibilitychange', visibility)
     const { data: listener } = supabase.auth.onAuthStateChange((_e, session) => {
@@ -157,6 +174,28 @@ export default function Home() {
       listener.subscription.unsubscribe()
     }
   }, [loadData, sessionExpired])
+
+  useEffect(() => {
+    if (!userId) return
+
+    const refresh = () => loadData(userId)
+    const channel = supabase
+      .channel(`pidkhid-sync-${userId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'user_state', filter: `user_id=eq.${userId}` }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'user_progress', filter: `user_id=eq.${userId}` }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'workout_logs', filter: `user_id=eq.${userId}` }, refresh)
+      .subscribe()
+
+    const interval = window.setInterval(refresh, 30000)
+    window.addEventListener('focus', refresh)
+    window.addEventListener('online', refresh)
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('focus', refresh)
+      window.removeEventListener('online', refresh)
+      supabase.removeChannel(channel)
+    }
+  }, [loadData, userId])
 
   const submitAuth = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -217,7 +256,7 @@ export default function Home() {
       .single()
     if (error) {
       setLogs(x => x.filter(l => l.id !== optimistic.id))
-      setNotice('Не вдалося зберегти підхід. Спробуйте ще раз.')
+      toast.error('Не вдалося зберегти підхід. Спробуйте ще раз.')
     } else setLogs(x => x.map(l => (l.id === optimistic.id ? data : l)))
   }
 
@@ -227,7 +266,7 @@ export default function Home() {
       const { error } = await supabase.from('workout_logs').delete().eq('id', log.id)
       if (error) {
         setLogs(x => [...x, log])
-        setNotice('Не вдалося видалити запис.')
+        toast.error('Не вдалося видалити запис.')
       }
     }
   }
@@ -235,7 +274,7 @@ export default function Home() {
   const finishDay = async () => {
     if (!userId) return
     if (state.current_cycle_day !== 4 && active.some(k => reps(k) < getProgress(k).daily_target)) {
-      setNotice('Спершу виконайте ціль усіх вправ на сьогодні.')
+      toast.warning('Спершу виконайте ціль усіх вправ на сьогодні.')
       return
     }
     const elevated: string[] = []
@@ -273,7 +312,7 @@ export default function Home() {
     await supabase
       .from('user_state')
       .upsert({ ...newState, user_id: userId }, { onConflict: 'user_id' })
-    setNotice(
+    toast.success(
       elevated.length
         ? `Рівень підвищено! Нова ціль для ${elevated.join(' · ')}`
         : 'День завершено. Чудова робота!'
@@ -291,7 +330,7 @@ export default function Home() {
       .update({ auto_progression: state.auto_progression })
       .eq('user_id', userId)
     setSettings(false)
-    setNotice('Налаштування збережено.')
+    toast.success('Налаштування збережено.')
   }
   const signOut = async () => {
     await supabase.auth.signOut()
@@ -311,26 +350,14 @@ export default function Home() {
         setTab={setAuthTab}
         onSubmit={submitAuth}
         error={authError}
-        notice={notice}
       />
     )
 
   return (
     <main className='mx-auto min-h-screen max-w-6xl px-5 py-6 md:px-10'>
-      {notice && (
-        <div className='fade-in fixed left-1/2 top-5 z-30 flex w-[min(520px,90vw)] -translate-x-1/2 items-center gap-3 rounded-2xl border border-emerald-400/20 bg-[#13231f] px-4 py-3 text-sm text-emerald-100 shadow-2xl'>
-          <Sparkles size={16} className='text-emerald-400' />
-          {notice}
-          <button className='ml-auto text-emerald-300' onClick={() => setNotice('')}>
-            <X size={16} />
-          </button>
-        </div>
-      )}
       <header className='mb-10 flex flex-wrap items-center justify-between gap-5'>
         <div className='flex items-center gap-3'>
-          <div className='grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 text-[#07110f]'>
-            <Dumbbell size={20} />
-          </div>
+          <img src='/logo.jpeg' alt='Логотип Base' className='h-10 w-10 rounded-xl object-cover' />
           <div>
             <h1 className='text-xl font-semibold tracking-tight'>Base</h1>
             <p className='text-xs text-slate-500'>Щоденна практика</p>
@@ -343,6 +370,14 @@ export default function Home() {
             className='rounded-lg p-2 text-slate-400 hover:bg-white/5 hover:text-white'
           >
             <Settings size={18} />
+          </button>
+          <button
+            onClick={refreshData}
+            disabled={syncing}
+            title='Оновити дані'
+            className='rounded-lg p-2 text-slate-400 hover:bg-white/5 hover:text-white disabled:opacity-50'
+          >
+            <RefreshCw size={18} className={syncing ? 'animate-spin' : ''} />
           </button>
           <button
             onClick={signOut}
@@ -376,7 +411,7 @@ export default function Home() {
           </div>
         </div>
       </section>
-      <nav className='mb-8 flex flex-wrap gap-2'>
+      <nav className='mb-8 flex flex-wrap items-center gap-2'>
         {[1, 2, 3, 4].map(day => (
           <button
             key={day}
@@ -386,8 +421,8 @@ export default function Home() {
             День {day}
           </button>
         ))}
-        <span className='ml-auto flex items-center gap-2 rounded-xl bg-amber-400/10 px-4 py-2 text-sm text-amber-300'>
-          <Timer size={15} /> Серія: <b className='tabular'>{state.streak_days}</b> дн.
+        <span className='flex max-w-full items-center gap-2 rounded-xl bg-amber-400/10 px-3 py-2 text-sm text-amber-300 sm:ml-auto sm:px-4'>
+          <Timer size={15} className='shrink-0' /> <span className='whitespace-nowrap'>Серія: <b className='tabular'>{state.streak_days}</b> дн.</span>
         </span>
       </nav>
       {state.current_cycle_day === 4 ? (
@@ -434,22 +469,18 @@ function AuthCard({
   tab,
   setTab,
   onSubmit,
-  error,
-  notice
+  error
 }: {
   tab: 'login' | 'signup'
   setTab: (x: 'login' | 'signup') => void
   onSubmit: (e: FormEvent<HTMLFormElement>) => void
   error: string
-  notice: string
 }) {
   return (
     <main className='grid min-h-screen place-items-center p-5'>
       <form onSubmit={onSubmit} className='glass w-full max-w-sm rounded-3xl p-7 fade-in'>
         <div className='mb-7 text-center'>
-          <div className='mx-auto mb-4 grid h-12 w-12 place-items-center rounded-2xl bg-emerald-400 text-[#07110f]'>
-            <Dumbbell />
-          </div>
+          <img src='/logo.jpeg' alt='Логотип Base' className='mx-auto mb-4 h-12 w-12 rounded-2xl object-cover' />
           <h1 className='text-2xl font-semibold'>Base</h1>
           <p className='mt-1 text-sm text-slate-500'>Твоя щоденна сила</p>
         </div>
@@ -485,7 +516,7 @@ function AuthCard({
             placeholder='••••••••'
           />
         </label>
-        {(error || notice) && <p className='mt-4 text-sm text-rose-300'>{error || notice}</p>}
+        {error && <p className='mt-4 text-sm text-rose-300'>{error}</p>}
         <button className='mt-6 w-full rounded-xl bg-emerald-400 py-3 font-semibold text-[#07110f] hover:bg-emerald-300'>
           {tab === 'login' ? 'Увійти' : 'Створити профіль'}
         </button>
